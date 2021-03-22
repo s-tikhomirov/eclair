@@ -20,11 +20,12 @@ import akka.actor.ActorRef
 import akka.pattern._
 import akka.util.Timeout
 import fr.acinq.bitcoin.Crypto.PublicKey
-import fr.acinq.bitcoin.{ByteVector32, ByteVector64, Crypto, Satoshi}
+import fr.acinq.bitcoin.{ByteVector32, ByteVector64, Crypto, Satoshi, SatoshiLong}
 import fr.acinq.eclair.TimestampQueryFilters._
 import fr.acinq.eclair.blockchain.OnChainBalance
 import fr.acinq.eclair.blockchain.bitcoind.BitcoinCoreWallet
 import fr.acinq.eclair.blockchain.bitcoind.BitcoinCoreWallet.WalletTransaction
+import fr.acinq.eclair.blockchain.bitcoind.rpc.ExtendedBitcoinClient
 import fr.acinq.eclair.blockchain.fee.{FeeratePerByte, FeeratePerKw}
 import fr.acinq.eclair.channel._
 import fr.acinq.eclair.db.AuditDb.{NetworkFee, Stats}
@@ -37,6 +38,7 @@ import fr.acinq.eclair.payment.relay.Relayer.{GetOutgoingChannels, OutgoingChann
 import fr.acinq.eclair.payment.send.PaymentInitiator.{SendPaymentRequest, SendPaymentToRouteRequest, SendPaymentToRouteResponse}
 import fr.acinq.eclair.router.Router._
 import fr.acinq.eclair.router.{NetworkStats, RouteCalculation, Router}
+import fr.acinq.eclair.transactions.Transactions
 import fr.acinq.eclair.wire._
 import scodec.bits.ByteVector
 
@@ -52,15 +54,19 @@ case class AuditResponse(sent: Seq[PaymentSent], received: Seq[PaymentReceived],
 
 case class TimestampQueryFilters(from: Long, to: Long)
 
+case class MutualCloseStatus(unpublished: Satoshi, unconfirmed: Satoshi, confirmed: Satoshi)
+
+case class GlobalBalance(mutualClose: MutualCloseStatus)
+
 case class SignedMessage(nodeId: PublicKey, message: String, signature: ByteVector)
 
 case class VerifiedMessage(valid: Boolean, publicKey: PublicKey)
 
 object TimestampQueryFilters {
   /** We use this in the context of timestamp filtering, when we don't need an upper bound. */
-  val MaxEpochMilliseconds = Duration.fromNanos(Long.MaxValue).toMillis
+  val MaxEpochMilliseconds: Long = Duration.fromNanos(Long.MaxValue).toMillis
 
-  def getDefaultTimestampFilters(from_opt: Option[Long], to_opt: Option[Long]) = {
+  def getDefaultTimestampFilters(from_opt: Option[Long], to_opt: Option[Long]): TimestampQueryFilters = {
     // NB: we expect callers to use seconds, but internally we use milli-seconds everywhere.
     val from = from_opt.getOrElse(0L).seconds.toMillis
     val to = to_opt.map(_.seconds.toMillis).getOrElse(MaxEpochMilliseconds)
@@ -145,6 +151,8 @@ trait Eclair {
   def onChainBalance(): Future[OnChainBalance]
 
   def onChainTransactions(count: Int, skip: Int): Future[Iterable[WalletTransaction]]
+
+  def globalBalance()(implicit timeout: Timeout): Future[GlobalBalance]
 
   def signMessage(message: ByteVector): SignedMessage
 
@@ -405,6 +413,54 @@ class EclairImpl(appKit: Kit) extends Eclair {
   override def usableBalances()(implicit timeout: Timeout): Future[Iterable[UsableBalance]] =
     (appKit.relayer ? GetOutgoingChannels()).mapTo[OutgoingChannels].map(_.channels.map(_.toUsableBalance))
 
+  override def globalBalance()(implicit timeout: Timeout): Future[GlobalBalance] = {
+    appKit.bitcoin match {
+      case Bitcoind(rpcClient) =>
+        val bitcoinClient = new ExtendedBitcoinClient(rpcClient)
+        for {
+          channelIds <- (appKit.register ? Symbol("channels")).mapTo[Map[ByteVector32, ActorRef]].map(_.keys)
+          channels <- Future.sequence(channelIds.map(channelId => sendToChannel[RES_GETINFO](Left(channelId), CMD_GETINFO(ActorRef.noSender))))
+          mutualCloseStatuses: Iterable[MutualCloseStatus] <- Future.sequence(channels
+            .map(_.data)
+            .collect {
+              case DATA_CLOSING(commitments, _, _, _, mutualClosePublished, None, None, None, None, Nil) =>
+                // if all other closing types are empty, mutualClosePublished must be non empty
+                for {
+                  res: Seq[Option[Int]] <- Future.sequence(mutualClosePublished.map(closingTx => bitcoinClient.getTxConfirmations(closingTx.tx.txid)))
+                  confirmations = res.flatten.headOption
+                } yield {
+                  // TODO: this is an approximation, we use the first closing tx in the list, which is not necessarily the one that will be used
+                  val mutualClose = mutualClosePublished.head
+                  val amount = mutualClose.toLocalOutput match {
+                    case Some(outputInfo) => outputInfo.amount
+                    case None =>
+                      // Normally this would mean that we don't actually have an output, but due to a migration
+                      // the data might not be accurate, see [[ChannelTypes0.migrateClosingTx]]
+                      // As a (hackish) workaround, we use the pubkeyscript to retrieve our output
+                      Transactions.findPubKeyScriptIndex(mutualClose.tx, commitments.localParams.defaultFinalScriptPubKey, amount_opt = None) match {
+                        case Right(outputIndex) => mutualClose.tx.txOut(outputIndex).amount
+                        case _ => 0.sat // either we don't have an output (below dust), or we have used a non-default pubkey script
+                      }
+                  }
+                  confirmations match {
+                    case Some(conf) if conf > 0 => MutualCloseStatus(unpublished = 0.sat, unconfirmed = 0.sat, confirmed = amount)
+                    case Some(0) => MutualCloseStatus(unpublished = 0.sat, unconfirmed = amount, confirmed = 0.sat)
+                    case None => MutualCloseStatus(unpublished = amount, unconfirmed = 0.sat, confirmed = 0.sat)
+                  }
+                }
+            })
+          mutualCloseStatus = mutualCloseStatuses.toList.reduce[MutualCloseStatus] {
+            case (a, b) => MutualCloseStatus(
+              unpublished = a.unpublished + b.unpublished,
+              unconfirmed = a.unconfirmed + b.unconfirmed,
+              confirmed = a.confirmed + b.confirmed
+            )
+          }
+        } yield GlobalBalance(mutualCloseStatus)
+      case _ => Future.failed(new IllegalArgumentException("this call is only available with a bitcoin core backend"))
+    }
+  }
+
   override def sendWithPreimage(externalId_opt: Option[String], recipientNodeId: PublicKey, amount: MilliSatoshi, paymentPreimage: ByteVector32, maxAttempts_opt: Option[Int], feeThreshold_opt: Option[Satoshi], maxFeePct_opt: Option[Double])(implicit timeout: Timeout): Future[UUID] = {
     val maxAttempts = maxAttempts_opt.getOrElse(appKit.nodeParams.maxPaymentAttempts)
     val defaultRouteParams = RouteCalculation.getDefaultRouteParams(appKit.nodeParams.routerConf)
@@ -429,6 +485,6 @@ class EclairImpl(appKit: Kit) extends Eclair {
     val signature = ByteVector64(recoverableSignature.tail)
     val recoveryId = recoverableSignature.head.toInt - 31
     val pubKeyFromSignature = Crypto.recoverPublicKey(signature, signedBytes, recoveryId)
-    VerifiedMessage(true, pubKeyFromSignature)
+    VerifiedMessage(valid = true, pubKeyFromSignature)
   }
 }

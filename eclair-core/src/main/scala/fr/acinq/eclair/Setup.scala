@@ -322,6 +322,7 @@ class Setup(datadir: File,
 
       kit = Kit(
         nodeParams = nodeParams,
+        bitcoin = bitcoin,
         system = system,
         watcher = watcher,
         paymentHandler = paymentHandler,
@@ -392,6 +393,7 @@ case class Electrum(electrumClient: ActorRef) extends Bitcoin
 // @formatter:on
 
 case class Kit(nodeParams: NodeParams,
+               bitcoin: Bitcoin,
                system: ActorSystem,
                watcher: ActorRef,
                paymentHandler: ActorRef,

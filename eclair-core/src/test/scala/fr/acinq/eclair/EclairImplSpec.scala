@@ -63,6 +63,7 @@ class EclairImplSpec extends TestKitBaseClass with FixtureAnyFunSuiteLike with I
     val server = TestProbe()
     val kit = Kit(
       TestConstants.Alice.nodeParams,
+      bitcoin = null,
       system,
       watcher.ref,
       paymentHandler.ref,
