@@ -17,7 +17,7 @@
 package fr.acinq.eclair.router
 
 import fr.acinq.bitcoin.Crypto.PublicKey
-import fr.acinq.bitcoin.{ByteVector32, SatoshiLong}
+import fr.acinq.bitcoin.{ByteVector32, Satoshi, SatoshiLong}
 import fr.acinq.eclair.db.sqlite.SqliteNetworkDb
 import fr.acinq.eclair.router.Graph.GraphStructure.{DirectedGraph, GraphEdge}
 import fr.acinq.eclair.router.Graph.RoutingHeuristics
@@ -29,6 +29,7 @@ import scodec.bits._
 
 import java.io.File
 import java.sql.DriverManager
+import scala.annotation.tailrec
 import scala.collection.immutable.SortedMap
 
 class GraphSpec extends AnyFunSuite {
@@ -59,13 +60,145 @@ class GraphSpec extends AnyFunSuite {
     ))
 
   test("mainnet graph analysis") {
-    val networkDb = new SqliteNetworkDb(DriverManager.getConnection(s"jdbc:sqlite:${new File("/path/to/folder", "network_09062020.sqlite")}"))
+    val networkDb = new SqliteNetworkDb(DriverManager.getConnection(s"jdbc:sqlite:${new File("/home/sergei/Documents/code/lightning/eclair", "network_09062020.sqlite")}"))
     val channels = networkDb.listChannels()
     assert(channels.keys.size === 32243)
     val nodes = networkDb.listNodes()
     assert(nodes.size === 5571)
     val graph = DirectedGraph.makeGraph(channels)
     assert(graph.vertexSet().nonEmpty)
+    /*
+    * We'd like you to extend this test to extract the following data:
+    * - the top 25 nodes by total capacity
+    * - for each of these nodes, the distance between them and any other of these top nodes
+    * - same exercise but using the number of public channels to rank nodes instead of their capacity
+    * */
+
+    /**
+     * Create a map from node IDs to total capacity and total degree.
+     *
+     * Current graph structure stores incoming edges only.
+     * Getting all adjacent edges (in + out) implies traversing the whole graph.
+     * Let's do it once to create a temporary data structure: nodeID -> (total_capacity, total_degree).
+     *
+     * @param graph - a directed graph representing a network snapshot.
+     * @return - a map: nodeID -> (degree, capacity)
+     */
+    def makeNodeToDegreeCapacityMap(graph : DirectedGraph): Map[PublicKey, (Int, Satoshi)] = {
+      // initialize a map from node ID to a (degree, capacity) tuple
+      var m = graph.vertexSet().map(n => n -> (0, Satoshi(0))).toMap
+      var seenChannelIds = Set.empty[ShortChannelId]
+      def handleEdge(edge: GraphEdge, m: Map[PublicKey, (Int, Satoshi)]): Map[PublicKey, (Int, Satoshi)] = {
+        // NB: an edge is a channel in one direction.
+        // Hence, a channel may be represented by one or two edges.
+        // We must only count each channel once!
+        if (!seenChannelIds.contains(edge.desc.shortChannelId)) {
+          // mark this channel as seen to avoid double-counting
+          seenChannelIds += edge.desc.shortChannelId
+          // for both nodes: add 1 to the total degree and capacity to the total capacity
+          m +
+            (edge.desc.a -> (m(edge.desc.a)._1 + 1, m(edge.desc.a)._2 + edge.capacity)) +
+            (edge.desc.b -> (m(edge.desc.b)._1 + 1, m(edge.desc.b)._2 + edge.capacity))
+        } else {
+          m
+        }
+      }
+      graph.edgeSet().foreach(e => m = handleEdge(e, m))
+      m
+    }
+
+    /**
+     * Get the map of distances from multiple sources to destination (Dijkstra's algorithm).
+     * Going "backwards" because the graph stores incoming edges.
+     *
+     * @param sources - a set of node IDs for source nodes
+     * @param destination - a node ID for destination node
+     * @return - a map of distances from each source to the destination
+     */
+    def distancesTo( sources: Set[PublicKey], destination: PublicKey): Map[PublicKey, Int] = {
+      def updateDistancesForNeighborsOf(currentNode: PublicKey, distances: Map[PublicKey, Int], visitedNodes: Set[PublicKey]): Map[PublicKey, Int] = {
+        def updateDistanceFor(currentNode: PublicKey, distances: Map[PublicKey, Int], neighbor: PublicKey): Map[PublicKey, Int] = {
+          val currentDistance = distances(neighbor)
+          val newDistance = 1 + distances(currentNode)
+          // update distance for the current node only if the new value is lower
+          if (newDistance < currentDistance) distances + (neighbor -> newDistance) else distances
+        }
+        var updatedDistances = distances
+        // only consider neighbors that haven't been visited yet
+        val neighbors = graph.getIncomingEdgesOf(currentNode).map(edge => edge.desc.a).filterNot(visitedNodes.contains)
+        // for each unvisited neighbor, update distances accordingly
+        neighbors.foreach(neighbor => updatedDistances = updateDistanceFor(currentNode, updatedDistances, neighbor))
+        updatedDistances
+      }
+      @tailrec
+      def distancesToRecursive( sources: Set[PublicKey],
+                                currentDestination: PublicKey,
+                                distances: Map[PublicKey, Int],
+                                visitedNodes: Set[PublicKey]): Map[PublicKey, Int] = {
+        if (sources.forall(visitedNodes.contains)) {
+          // we've visited all sources (recursion base case)
+          distances
+        } else {
+          // update distances of all neighbors of current node
+          val updatedDistances = updateDistancesForNeighborsOf(currentDestination, distances, visitedNodes)
+          // mark current node as visited
+          val updatedVisitedNodes = visitedNodes + currentDestination
+          // choose next unvisited node with lowest distance as destination
+          val nextCurrentDestination = updatedDistances
+            .filterNot(nodeAndDistance => visitedNodes.contains(nodeAndDistance._1))
+            .minBy(_._2)._1
+          // recursively get distances w.r.t. next destination node
+          distancesToRecursive(sources, nextCurrentDestination, updatedDistances, updatedVisitedNodes)
+        }
+      }
+      // initial distances: 0 at destination, infinity at all other nodes
+      val initialDistances : Map[PublicKey, Int] = graph.vertexSet()
+        .map(n => n -> (if (n === destination) 0 else Int.MaxValue)).toMap
+      // we haven't visited any nodes yet
+      val initialVisitedNodes : Set[PublicKey] = Set.empty
+      // get distances recursively
+      distancesToRecursive(sources, destination, initialDistances, initialVisitedNodes)
+        // return only distances from sources we're interested in
+        .filter(nodeDistance => sources.contains(nodeDistance._1))
+    }
+
+    /**
+     * Get a set of node IDs of of top nodes' by total capacity or by total degree.
+     *
+     * @param m - a map from node IDs to (degree, capacity)
+     * @param numTopNodes - the number of top nodes to return
+     * @param byCapacity - order by capacity if true, by degree if false
+     * @return - a set of node IDs
+     */
+    def getTopNodes(m: Map[PublicKey, (Int, Satoshi)], numTopNodes: Int, byCapacity: Boolean): Set[PublicKey] = {
+      (if (byCapacity) m.toSeq.sortBy(_._2._2) else m.toSeq.sortBy(_._2._1))
+        .reverse.slice(0, numTopNodes).map(n => n._1).toSet
+    }
+
+    /**
+     * Get all pairwise distances among given nodes (except distances to itself).
+     *
+     * @param nodes - a set of nodes to consider
+     * @return - a map such that map(b)(a) is the distance from a to b
+     *         (kinda backwards because our graph stores incoming edges,
+     *         but we can convert to another map s.t. map(a)(b) is the distance)
+     */
+    def getDistances(nodes: Set[PublicKey]): Map[PublicKey, Map[PublicKey, Int]] = {
+      nodes.map(destination => destination -> distancesTo(nodes.filter(_ != destination), destination)).toMap
+    }
+
+    val numTopNodes = 25
+    val nodeToDegreeCapacityMap = makeNodeToDegreeCapacityMap(graph)
+    for (byCapacity <- List(true, false)) {
+      val topNodes = getTopNodes(nodeToDegreeCapacityMap, numTopNodes, byCapacity = byCapacity)
+      val distancesAmongNodes = getDistances(topNodes)
+      println("\nDistances among top " + numTopNodes + " nodes by " + (if (byCapacity) "capacity" else "degree") + ":\n")
+      println(distancesAmongNodes.map(
+        destinationAndDistances => "To %s from \n  %s".format(destinationAndDistances._1, destinationAndDistances._2
+          .map(sourceAndDistance => "%s : %s".format(sourceAndDistance._1, sourceAndDistance._2))
+          .mkString("\n  ")))
+        .mkString("\n\n"))
+    }
   }
 
   test("instantiate a graph, with vertices and then add edges") {
